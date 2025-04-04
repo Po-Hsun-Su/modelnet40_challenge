@@ -1,0 +1,6 @@
+ModelNet10/
+ModelNet40/
+ModelNet40_train_chunk/
+ModelNet40_test_chunk/
+*.pdf
+runs/
