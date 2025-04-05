@@ -83,4 +83,4 @@ We apply simple rotation of 90 degree increment on the input voxels. There are 6
 No augmentation is applied in test. 
 
 ## Report
-Report of the experimental results is available [here](https://docs.google.com/document/d/1wC6ioUNEpQmEv1LQPvsOwHz4npujFde6G4ym6AKifDY/edit?tab=t.0)# Challenge Overview
+Report of the experimental results is available [here](https://docs.google.com/document/d/1wC6ioUNEpQmEv1LQPvsOwHz4npujFde6G4ym6AKifDY/edit?tab=t.0)
