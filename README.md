@@ -52,15 +52,38 @@ of the shifted patches.
 
 ## Code setup
 There are 3 main scripts in this experiment:
-1. preprocess_to_pt.py: A script to preprocess the data into chunks of .pt files. This preprocess step is crucial to drastically reduce data loading time because parsing off files is 
-extremely slow
+1. preprocess_to_pt.py: A script to preprocess the data into chunks of .pt files. This preprocess step is crucial to drastically reduce data loading time. because parsing off files is 
+extremely slow. 
 2. training.py: The main training script
 3. inference.py: An interface to load a pre-trained model and run on off file(s) to produce classification and segmentation result. 
 
 ## Experiments: 
+For all experiments, we train the model for 100 epoches with a starting learning rate of 1e-3. The optimizer is Adam and the learning rate schedular is ReduceLROnPlateau on 
+average training loss per epoch. Final learning rate is 1e-6. The batch size is 64.
 
-### Experiment 1: Masked voxel pre-training + simple classification head on mean pooling of encoded tokens
+### Baseline model archicture 
+The model is a typical transformer encoder-decoder model. 
+The inputs are N=216 patch tokens. The decoder outputs are also N=216 patch tokens.
+Embedding dim (aka: d_model) is default to 128. The encoder has 4 layers and the decoder has 2 layers. 
+All hyper parameters are recorded in the experiment output directory. 
 
-### Experiment 2: Experiment 1 + LFQ tokenizer
+### Experiment 0: Class supervised only
+The classification head is a linear layer of shape (embedding dim, num classes). The input to
+the classification head is the mean pooling of encoded tokens from the transformer encoder.
+Cross entropy loss is the criteria for classification supervision.
+This experiment output is in "runs\cls_only_base_line".
+
+The test accuracy is 75.81%. Average training classification loss at the final epoch is 0.5088 and the test classification loss is 0.7573.
+
+### Experiment 1: Experiment 0 + Masked voxel pre-training
+Masked voxel pre-training randomly masked out 75% of the input patches and the transformer model is required to reconstruct the missing patches at the decoder output.
+We let the model pre-train for 90 epochs with masking loss (we keep the classification on for simplicity). Afther that, masking and reconstruction loss are turned off and 
+the classification head is trained for 10 more epoches.
+
+### Experiment 2: Experiment 1 + Data augmentation
+We apply simple rotation of 90 degree increment on the input voxels. There are 6 rotations and a mirror per rotation so 12 augmentation for each sample. 
+No augmentation is applied in test. 
+
+
 
 

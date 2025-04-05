@@ -7,23 +7,57 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 import time
+import random
+import json
+
+
+def random_12_augmentation(voxel):
+    """
+    Given a voxel tensor of shape (1, grid_size, grid_size, grid_size),
+    generate 6 rotated versions:
+      - 4 rotations in the depth–width plane (dims=(1,3)) with k=0,1,2,3,
+      - 2 rotations in the depth–height plane (dims=(1,2)) with k=1 and k=3.
+    Then for each of these, also produce the mirror image by flipping along the width axis (dim=3).
+    Randomly select one from the resulting 12 augmentations.
+    """
+    aug_funcs = []
+    # 4 rotations in the depth–width plane (preserving the height axis)
+    for k in range(4):
+        # Capture k as default argument so that the lambda uses the current value of k.
+        aug_funcs.append(lambda x, k=k: torch.rot90(x, k=k, dims=(1,3)))
+    # 2 rotations in the depth–height plane (which rotates the vertical axis)
+    for k in [1, 3]:
+        aug_funcs.append(lambda x, k=k: torch.rot90(x, k=k, dims=(1,2)))
+    
+    # Now create a new list with both the original and its mirror (flip along width axis: dim=3)
+    all_funcs = []
+    for func in aug_funcs:
+        all_funcs.append(func)
+        # Define a new lambda that applies the original augmentation then flips along dim 3.
+        all_funcs.append(lambda x, f=func: torch.flip(f(x), dims=[3]))
+    
+    # Randomly choose one of the 12 transformations and apply it.
+    chosen_func = random.choice(all_funcs)
+    return chosen_func(voxel)
+
 
 class ChunkedModelNetDataset(Dataset):
-    def __init__(self, chunk_files):
+    def __init__(self, chunk_files, transform=None):
         """
         Args:
             chunk_files (list of str): List of paths to serialized chunk files.
                                        Each file is expected to contain a list of tuples (voxel_tensor, label).
+            transform (callable, optional): A function/transform that takes in a voxel tensor and returns an augmented version.
         """
         self.chunk_files = chunk_files
+        self.transform = transform
         self.chunk_lengths = []
         self.cumulative_lengths = []
-        self.cache = {}  # A simple cache to store loaded chunks in memory
+        self.cache = {}  # Cache for loaded chunks
 
         total = 0
-        # Precompute the number of samples in each chunk
+        # Precompute number of samples in each chunk
         for file in self.chunk_files:
-            # Load just to get the length; each chunk file should be a list of samples
             data = torch.load(file)
             length = len(data)
             self.chunk_lengths.append(length)
@@ -35,22 +69,24 @@ class ChunkedModelNetDataset(Dataset):
         return self.total_samples
 
     def __getitem__(self, idx):
-        # Determine which chunk file contains the idx-th sample
+        # Determine which chunk file contains the idx-th sample.
         chunk_idx = 0
         while idx >= self.cumulative_lengths[chunk_idx]:
             chunk_idx += 1
 
-        # Determine the sample index within the chosen chunk
         if chunk_idx == 0:
             inner_idx = idx
         else:
             inner_idx = idx - self.cumulative_lengths[chunk_idx - 1]
 
-        # Load the chunk if not already in cache
+        # Load the chunk if not in cache.
         if chunk_idx not in self.cache:
-            # Note: weights_only flag is preserved from your code.
             self.cache[chunk_idx] = torch.load(self.chunk_files[chunk_idx], weights_only=True)
-        sample = self.cache[chunk_idx][inner_idx]
+        sample = self.cache[chunk_idx][inner_idx]  # sample is a tuple: (voxel_tensor, label)
+        if self.transform is not None:
+            voxel_tensor, label = sample
+            voxel_tensor = self.transform(voxel_tensor)
+            sample = (voxel_tensor, label)
         return sample
 
 ###########################################
@@ -132,6 +168,10 @@ class MAE3D(nn.Module):
         patches = imgs.reshape(B, C, new_D, p, new_H, p, new_W, p)
         patches = patches.permute(0, 2, 4, 6, 1, 3, 5, 7).reshape(B, new_D * new_H * new_W, p**3)
         return patches
+    
+    def set_mask_ratio(self, mask_ratio):
+        """Set the mask ratio for the model. This is useful for fine-tuning and evaluation."""
+        self.mask_ratio = mask_ratio
 
     def forward(self, x):
         """
@@ -203,6 +243,9 @@ class MAE3D(nn.Module):
 def eval_mae3d(model, epoch, test_data_loader, device, writer, cls_loss_weight):
     # Evaluate on test data
     model.eval()
+    model_mask_ratio = model.mask_ratio
+    model.set_mask_ratio(0.0)  # Disable masking for evaluation
+    
     test_total_recon_loss = 0
     test_total_cls_loss = 0
     correct = 0
@@ -237,14 +280,19 @@ def eval_mae3d(model, epoch, test_data_loader, device, writer, cls_loss_weight):
     else:
         print(f"Epoch [{epoch+1}] Test Recon Loss: {test_avg_recon_loss:.4f}")
     model.train()  # Set back to training mode
+    model.set_mask_ratio(model_mask_ratio)  # Restore original mask ratio
 
-def train_mae3d(model, dataloader, test_data_loader, optimizer, lr_scheduler, device, epochs=10, log_dir='runs/mae3d', cls_loss_weight=1.0):
+def train_mae3d(model, dataloader, test_data_loader, optimizer, lr_scheduler, device, epochs=10, pretrain_stop_epoch=None, log_dir='runs/mae3d', cls_loss_weight=1.0, recon_loss_weight=1.0):
     model.train()
     writer = SummaryWriter(log_dir=log_dir)
     global_step = 0
     for epoch in range(epochs):
         total_recon_loss = 0
         total_cls_loss = 0
+        if pretrain_stop_epoch is not None and epoch >= pretrain_stop_epoch:
+            model.set_mask_ratio(0.0)  # Disable masking for pretraining
+            recon_loss_weight = 0.0  # Disable reconstruction loss
+
         for batch_idx, (voxels, labels) in enumerate(dataloader):
             voxels = voxels.to(device)  # shape: (B, 1, grid_size, grid_size, grid_size)
             labels = labels.to(device)
@@ -257,8 +305,10 @@ def train_mae3d(model, dataloader, test_data_loader, optimizer, lr_scheduler, de
                 pred, gt, mask = outputs
                 cls_loss = 0.0
             mask = mask.unsqueeze(-1)
-            recon_loss = ((pred - gt)**2 * mask).sum() / mask.sum()
-            loss = recon_loss + cls_loss_weight * cls_loss
+
+            recon_loss = ((pred - gt)**2 * mask).sum() / (mask.sum() + 1e-6)
+
+            loss = recon_loss_weight*recon_loss + cls_loss_weight * cls_loss
             loss.backward()
             optimizer.step()
             
@@ -307,28 +357,43 @@ class DummyVoxelDataset(Dataset):
 ###########################################
 # Main Training Script with Click Options
 ###########################################
-
 @click.command()
-@click.option('--train-chunk-dir', default='ModelNet40_train_chunk', help='Directory for training chunk files')
-@click.option('--test-chunk-dir', default='ModelNet40_test_chunk', help='Directory for test chunk files')
-@click.option('--patch-size', default=5, type=int, help='Size of 3D patches')
-@click.option('--grid-size', default=30, type=int, help='Size of input voxel grid')
-@click.option('--embed-dim', default=128, type=int, help='Embedding dimension for patch tokens')
-@click.option('--encoder-depth', default=4, type=int, help='Number of transformer encoder layers')
-@click.option('--decoder-depth', default=2, type=int, help='Number of transformer decoder layers')
-@click.option('--num-heads', default=4, type=int, help='Number of attention heads')
-@click.option('--mask-ratio', default=0.75, type=float, help='Fraction of patch tokens to mask')
-@click.option('--batch-size', default=64, type=int, help='Training batch size')
-@click.option('--epochs', default=100, type=int, help='Number of training epochs')
-@click.option('--lr', default=1e-3, type=float, help='Learning rate')
-@click.option('--cls-loss-weight', default=1.0, type=float, help='Weight for classification loss')
-@click.option('--log-dir', default=f'runs/mae3d_{time.strftime("%Y%m%d%H%S")}', help='Directory for tensorboard logs')
-@click.option('--num-workers', default=2, type=int, help='Number of dataloader workers')
-def main(train_chunk_dir, test_chunk_dir, patch_size, grid_size, embed_dim, 
-            encoder_depth, decoder_depth, num_heads, mask_ratio, batch_size, epochs, lr, 
-            cls_loss_weight, log_dir, num_workers):
+@click.option('--experiment-name', '-n', default=None, type=str, help='Name of the experiment for logging purposes')
+@click.option('--train-chunk-dir', '-tcd', default='ModelNet40_train_chunk', help='Directory for training chunk files')
+@click.option('--test-chunk-dir', '-ted', default='ModelNet40_test_chunk', help='Directory for test chunk files')
+@click.option('--patch-size', '-ps', default=5, type=int, help='Size of 3D patches')
+@click.option('--grid-size', '-gs', default=30, type=int, help='Size of input voxel grid')
+@click.option('--embed-dim', '-ed', default=128, type=int, help='Embedding dimension for patch tokens')
+@click.option('--encoder-depth', '-end', default=4, type=int, help='Number of transformer encoder layers')
+@click.option('--decoder-depth', '-ded', default=2, type=int, help='Number of transformer decoder layers')
+@click.option('--num-heads', '-nh', default=4, type=int, help='Number of attention heads')
+@click.option('--mask-ratio', '-mr', default=0.75, type=float, help='Fraction of patch tokens to mask')
+@click.option('--batch-size', '-bs', default=64, type=int, help='Training batch size')
+@click.option('--epochs', '-e', default=100, type=int, help='Number of training epochs')
+@click.option('--pretrain-stop-epoch', '-mps', default=None, type=int, help='Epoch to stop pretraining')
+@click.option('--lr', '-lr', default=1e-3, type=float, help='Learning rate')
+@click.option('--cls-loss-weight', '-clw', default=1.0, type=float, help='Weight for classification loss')
+@click.option('--recon-loss-weight', '-rlw', default=1.0, type=float, help='Weight for reconstruction loss')
+@click.option('--num-workers', '-nw', default=4,type=int, help='Number of dataloader workers')
+@click.option('--augment', is_flag=True, help='Apply 12-side rotation augmentation (6 rotations + mirror) to voxel data')
+@click.pass_context
+def main(ctx, experiment_name, train_chunk_dir, test_chunk_dir, patch_size, grid_size, embed_dim, 
+            encoder_depth, decoder_depth, num_heads, mask_ratio, batch_size, epochs, pretrain_stop_epoch, lr, 
+            cls_loss_weight, recon_loss_weight, num_workers, augment):
     """Train a 3D Masked Autoencoder (MAE) model on ModelNet data with a classification head."""
+    # Save the arguments for reproducibility
     
+    log_dir = os.path.join('runs', experiment_name) if experiment_name else 'runs/mae3d'
+    log_dir += time.strftime("_%Y%m%d-%H%M%S")
+    # Create experiment directory if it doesn't exist
+    os.makedirs(log_dir, exist_ok=True)
+
+    # Dump to JSON file
+    args = ctx.params
+    with open(os.path.join(log_dir, 'args_dump.json'), 'w') as f:
+        json.dump(args, f, indent=2)
+
+    print(f"Configuration saved to {os.path.join(log_dir, 'config.json')}")
     # Set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -344,12 +409,9 @@ def main(train_chunk_dir, test_chunk_dir, patch_size, grid_size, embed_dim,
     print(f"Found {len(train_chunk_files)} training chunk files")
     print(f"Found {len(test_chunk_files)} test chunk files")
 
-    # For demonstration, you can uncomment these two lines to use a dummy dataset instead:
-    # dataset = DummyVoxelDataset(num_samples=500, grid_size=grid_size, num_classes=40)
-    # test_dataset = DummyVoxelDataset(num_samples=100, grid_size=grid_size, num_classes=40)
-    # Otherwise, use your chunked datasets:
+    transform = random_12_augmentation if augment else None
     print("Loading training dataset...")
-    dataset = ChunkedModelNetDataset(train_chunk_files)
+    dataset = ChunkedModelNetDataset(train_chunk_files, transform=transform)
     print(f"Training dataset size: {len(dataset)}")
     
     print("Loading test dataset...")
@@ -370,7 +432,7 @@ def main(train_chunk_dir, test_chunk_dir, patch_size, grid_size, embed_dim,
     # Setup optimizer and learning rate scheduler
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.1, patience=5
+        optimizer, mode='min', factor=0.1, patience=5,min_lr =1e-6
     )
     
     # Create log directory if it doesn't exist
@@ -378,7 +440,7 @@ def main(train_chunk_dir, test_chunk_dir, patch_size, grid_size, embed_dim,
     
     print(f"Starting training for {epochs} epochs...")
     train_mae3d(model, data_loader, test_data_loader, optimizer, lr_scheduler, device, 
-                epochs=epochs, log_dir=log_dir, cls_loss_weight=cls_loss_weight)
+                epochs=epochs, pretrain_stop_epoch=pretrain_stop_epoch, log_dir=log_dir, cls_loss_weight=cls_loss_weight, recon_loss_weight=recon_loss_weight)
     
     torch.save(model.state_dict(), os.path.join(log_dir, 'mae3d_model.pth'))
     
