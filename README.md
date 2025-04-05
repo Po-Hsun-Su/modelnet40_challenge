@@ -44,7 +44,7 @@ reconstruct the masked tokens.
 Besides masked modeling, vector-quantized variation auto encoder (VQ-VAE) is anthoer group of powerful techiques for pre-training. It introduce constriction in the model
 which effectively force the model to distill discrete latent representation. In this experiment, we use the lookup free quantion [LFQ](https://github.com/lucidrains/vector-quantize-pytorch?tab=readme-ov-file#lookup-free-quantization) to learn a discrete codebook for each patch of voxel. 
 
-### Segmentation 
+### Segmentation
 Without additional segmentation learning task, we can produce segmentation result leaveraging the discrete classification of the model.
 For exampling, we can run the supervised-learned classifier head on each patch and group the patch if the patch are adjacent and share the same predicted class.
 The alternative is to use latent discrete code of the VQ-VAE. To generate smoother segmentation, we can do the same on shifted patches and aggregate the discrete label
