@@ -1,3 +1,4 @@
+import click
 import os
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -5,6 +6,7 @@ from tqdm import tqdm
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
+import time
 
 class ChunkedModelNetDataset(Dataset):
     def __init__(self, chunk_files):
@@ -46,7 +48,7 @@ class ChunkedModelNetDataset(Dataset):
 
         # Load the chunk if not already in cache
         if chunk_idx not in self.cache:
-            self.cache[chunk_idx] = torch.load(self.chunk_files[chunk_idx])
+            self.cache[chunk_idx] = torch.load(self.chunk_files[chunk_idx], weights_only=True)
         sample = self.cache[chunk_idx][inner_idx]
         return sample
 
@@ -218,6 +220,11 @@ def train_mae3d(model, dataloader, test_data_loader, optimizer, lr_scheduler, de
         avg_loss = total_loss / len(dataloader)
         writer.add_scalar('Loss/Epoch', avg_loss, epoch)
         print(f"Epoch [{epoch+1}/{epochs}] Average Loss: {avg_loss:.4f}")
+        # Update the learning rate scheduler using the training loss
+        lr_scheduler.step(avg_loss)
+        current_lr = optimizer.param_groups[0]['lr']
+        writer.add_scalar('Learning Rate', current_lr, epoch)
+        print(f"Current learning rate: {current_lr}")
         
         eval_mae3d(model, epoch, test_data_loader, device, writer)
 
@@ -237,26 +244,76 @@ class DummyVoxelDataset(Dataset):
         label = 0  # dummy label
         return voxel, label
 
+@click.command()
+@click.option('--train-chunk-dir', default='ModelNet40_train_chunk', help='Prefix for training chunk files')
+@click.option('--test-chunk-dir', default='ModelNet40_test_chunk', help='Prefix for test chunk files')
+@click.option('--patch-size', default=5, type=int, help='Size of 3D patches')
+@click.option('--grid-size', default=30, type=int, help='Size of input voxel grid')
+@click.option('--embed-dim', default=128, type=int, help='Embedding dimension for patch tokens')
+@click.option('--encoder-depth', default=4, type=int, help='Number of transformer encoder layers')
+@click.option('--decoder-depth', default=2, type=int, help='Number of transformer decoder layers')
+@click.option('--num-heads', default=4, type=int, help='Number of attention heads')
+@click.option('--mask-ratio', default=0.75, type=float, help='Fraction of patch tokens to mask')
+@click.option('--batch-size', default=64, type=int, help='Training batch size')
+@click.option('--epochs', default=100, type=int, help='Number of training epochs')
+@click.option('--lr', default=1e-3, type=float, help='Learning rate')
+@click.option('--log-dir', default=f'runs/mae3d_{time.strftime("%Y%m%d")}', help='Directory for tensorboard logs')
+@click.option('--num-workers', default=2, type=int, help='Number of dataloader workers')
+def main(train_chunk_dir, test_chunk_dir, patch_size, grid_size, embed_dim, 
+            encoder_depth, decoder_depth, num_heads, mask_ratio, batch_size, epochs, lr, 
+            log_dir, num_workers):
+    """Train a 3D Masked Autoencoder (MAE) model on ModelNet data."""
+    
+    # Set up device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # Create dataset paths
+    train_chunk_files = [os.path.join(train_chunk_dir, f) for f in os.listdir(train_chunk_dir) if f.endswith('.pt')]
+    test_chunk_files = [os.path.join(test_chunk_dir, f) for f in os.listdir(test_chunk_dir) if f.endswith('.pt')]
+
+    # Sort files to ensure consistent order
+    train_chunk_files.sort()
+    test_chunk_files.sort()
+
+    print(f"Found {len(train_chunk_files)} training chunk files")
+    print(f"Found {len(test_chunk_files)} test chunk files")
+
+    # Load datasets
+    print("Loading training dataset...")
+    dataset = ChunkedModelNetDataset(train_chunk_files)
+    print(f"Training dataset size: {len(dataset)}")
+    
+    print("Loading test dataset...")
+    test_dataset = ChunkedModelNetDataset(test_chunk_files)
+    print(f"Test dataset size: {len(test_dataset)}")
+    
+    # Create data loaders
+    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    test_data_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    
+    # Initialize model
+    print("Initializing MAE3D model...")
+    model = MAE3D(patch_size=patch_size, grid_size=grid_size, embed_dim=embed_dim, 
+                    encoder_depth=encoder_depth, decoder_depth=decoder_depth, 
+                    num_heads=num_heads, mask_ratio=mask_ratio)
+    model.to(device)
+    
+    # Setup optimizer and learning rate scheduler
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.1, patience=5
+    )
+    
+    # Create log directory if it doesn't exist
+    os.makedirs(os.path.dirname(log_dir), exist_ok=True)
+    
+    print(f"Starting training for {epochs} epochs...")
+    train_mae3d(model, data_loader, test_data_loader, optimizer, lr_scheduler, device, 
+                epochs=epochs, log_dir=log_dir)
+    
+    print("Training complete!")
 
 # Example usage:
 if __name__ == '__main__':
-    # Assuming chunk files are named: 'modelnet40_test_chunk_0.pt' ... 'modelnet40_test_chunk_9.pt'
-    chunk_files = [f"modelnet40_train_chunk_{i}.pt" for i in range(100)]
-    dataset = ChunkedModelNetDataset(chunk_files)
-
-    test_chunk_files = [f"modelnet40_test_chunk_{i}.pt" for i in range(20)]
-    test_dataset = ChunkedModelNetDataset(test_chunk_files)
-    
-    data_loader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=2)
-    test_data_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=2)
-    
-    # Setup device, model, and optimizer.
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MAE3D(patch_size=5, grid_size=30, embed_dim=64, encoder_depth=2, decoder_depth=1, num_heads=4, mask_ratio=0.75)
-    model.to(device)
-    
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    lr_scheduler = torch.optim.lr_scheduler.reduce_lr_on_plateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
-    
-    # Train for a few epochs.
-    train_mae3d(model, data_loader, test_data_loader, optimizer, lr_scheduler, device, epochs=100)
+    main()
