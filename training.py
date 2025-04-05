@@ -48,12 +48,18 @@ class ChunkedModelNetDataset(Dataset):
 
         # Load the chunk if not already in cache
         if chunk_idx not in self.cache:
+            # Note: weights_only flag is preserved from your code.
             self.cache[chunk_idx] = torch.load(self.chunk_files[chunk_idx], weights_only=True)
         sample = self.cache[chunk_idx][inner_idx]
         return sample
 
+###########################################
+# MAE3D Model with Optional Classifier Head
+###########################################
+
 class MAE3D(nn.Module):
-    def __init__(self, patch_size=5, grid_size=30, embed_dim=64, encoder_depth=2, decoder_depth=1, num_heads=4, mask_ratio=0.75):
+    def __init__(self, patch_size=5, grid_size=30, embed_dim=64, encoder_depth=2, 
+                 decoder_depth=1, num_heads=4, mask_ratio=0.75, num_classes=None):
         """
         Args:
           patch_size: size of one 3D patch (e.g., 5 for 5x5x5 patches)
@@ -63,6 +69,7 @@ class MAE3D(nn.Module):
           decoder_depth: number of transformer layers in decoder
           num_heads: number of attention heads
           mask_ratio: fraction of patch tokens to mask (e.g., 0.75)
+          num_classes: if provided, add a classifier head for classification.
         """
         super(MAE3D, self).__init__()
         self.patch_size = patch_size
@@ -71,6 +78,7 @@ class MAE3D(nn.Module):
         self.num_patches = self.num_patches_per_dim ** 3         # e.g., 6^3 = 216
         self.embed_dim = embed_dim
         self.mask_ratio = mask_ratio
+        self.num_classes = num_classes
         
         # Patch embedding using a Conv3d with kernel_size and stride = patch_size.
         self.patch_embed = nn.Conv3d(in_channels=1, out_channels=embed_dim, kernel_size=patch_size, stride=patch_size)
@@ -93,6 +101,12 @@ class MAE3D(nn.Module):
         # Prediction head: project decoder output to a reconstruction of the patch,
         # i.e. a flattened voxel patch of size (patch_size^3).
         self.pred_head = nn.Linear(embed_dim, patch_size**3)
+        
+        # Optional classifier head.
+        if self.num_classes is not None:
+            self.cls_head = nn.Linear(embed_dim, num_classes)
+        else:
+            self.cls_head = None
         
         self.initialize_weights()
         
@@ -124,9 +138,8 @@ class MAE3D(nn.Module):
         Args:
           x: input tensor of shape (B, 1, grid_size, grid_size, grid_size)
         Returns:
-          pred: reconstruction prediction for each patch (B, num_patches, patch_size^3)
-          x_gt: ground truth flattened voxel patches (B, num_patches, patch_size^3)
-          mask: binary mask indicating which patches were masked (B, num_patches)
+          For pretraining: (pred, x_gt, mask, cls_logits) if classifier head exists,
+                           otherwise (pred, x_gt, mask)
         """
         B = x.size(0)
         # 1. Patch embedding: (B, embed_dim, D, H, W) with D=H=W = grid_size/patch_size.
@@ -155,98 +168,149 @@ class MAE3D(nn.Module):
         encoded = self.encoder(x_visible)  # (num_visible, B, embed_dim)
         encoded = encoded.transpose(0, 1)   # (B, num_visible, embed_dim)
         
-        # 4. Prepare tokens for the decoder.
+        # 4. Classification branch: compute global representation from visible tokens.
+        if self.cls_head is not None:
+            # We average over the visible tokens.
+            cls_features = encoded.mean(dim=1)  # (B, embed_dim)
+            cls_logits = self.cls_head(cls_features)  # (B, num_classes)
+        else:
+            cls_logits = None
+        
+        # 5. Prepare tokens for the decoder.
         # Initialize full sequence with mask token and then replace visible tokens.
         x_decoder = self.mask_token.expand(B, self.num_patches, self.embed_dim).clone()
         for b in range(B):
             x_decoder[b, ids_keep[b]] = encoded[b]
         x_decoder = x_decoder + self.decoder_pos_embed
         
-        # 5. Decoder: using transformer encoder (applied to the full set of tokens).
+        # 6. Decoder: using transformer encoder (applied to the full set of tokens).
         x_decoder = x_decoder.transpose(0, 1)  # (num_patches, B, embed_dim)
         decoded = self.decoder(x_decoder)      # (num_patches, B, embed_dim)
         decoded = decoded.transpose(0, 1)        # (B, num_patches, embed_dim)
         
-        # 6. Prediction: reconstruct each patch
+        # 7. Prediction: reconstruct each patch.
         pred = self.pred_head(decoded)  # (B, num_patches, patch_size^3)
         
-        return pred, x_gt, mask
+        if self.cls_head is not None:
+            return pred, x_gt, mask, cls_logits
+        else:
+            return pred, x_gt, mask
 
-#######################################
-# Training Loop for Pretraining the MAE #
-#######################################
+#############################################
+# Training Loop with Reconstruction & Classification Loss
+#############################################
 
-def eval_mae3d(model, epoch, test_data_loader, device, writer):
+def eval_mae3d(model, epoch, test_data_loader, device, writer, cls_loss_weight):
     # Evaluate on test data
     model.eval()
-    test_total_loss = 0
+    test_total_recon_loss = 0
+    test_total_cls_loss = 0
+    correct = 0
+    total = 0
     with torch.no_grad():
         for test_voxels, test_labels in test_data_loader:
             test_voxels = test_voxels.to(device)
-            test_pred, test_gt, test_mask = model(test_voxels)
+            test_labels = test_labels.to(device)
+            outputs = model(test_voxels)
+            if len(outputs) == 4:
+                test_pred, test_gt, test_mask, test_cls_logits = outputs
+                cls_loss = F.cross_entropy(test_cls_logits, test_labels)
+                test_total_cls_loss += cls_loss.item()
+                # Compute accuracy
+                _, predicted = torch.max(test_cls_logits, dim=1)
+                correct += (predicted == test_labels).sum().item()
+                total += test_labels.size(0)
+            else:
+                test_pred, test_gt, test_mask = outputs
             test_mask = test_mask.unsqueeze(-1)
-            test_loss = ((test_pred - test_gt)**2 * test_mask).sum() / test_mask.sum()
-            test_total_loss += test_loss.item()
+            recon_loss = ((test_pred - test_gt)**2 * test_mask).sum() / test_mask.sum()
+            test_total_recon_loss += recon_loss.item()
 
-    test_avg_loss = test_total_loss / len(test_data_loader)
-    writer.add_scalar('Loss/Test', test_avg_loss, epoch)
-    print(f"Epoch [{epoch+1}] Test Loss: {test_avg_loss:.4f}")
-    model.train()  # Set the model back to training mode
+    test_avg_recon_loss = test_total_recon_loss / len(test_data_loader)
+    writer.add_scalar('Loss/Test_Recon', test_avg_recon_loss, epoch)
+    if total > 0:
+        test_avg_cls_loss = test_total_cls_loss / len(test_data_loader)
+        test_accuracy = correct / total
+        writer.add_scalar('Loss/Test_Cls', test_avg_cls_loss, epoch)
+        writer.add_scalar('Accuracy/Test', test_accuracy, epoch)
+        print(f"Epoch [{epoch+1}] Test Recon Loss: {test_avg_recon_loss:.4f}, Test Cls Loss: {test_avg_cls_loss:.4f}, Accuracy: {test_accuracy*100:.2f}%")
+    else:
+        print(f"Epoch [{epoch+1}] Test Recon Loss: {test_avg_recon_loss:.4f}")
+    model.train()  # Set back to training mode
 
-def train_mae3d(model, dataloader, test_data_loader, optimizer, lr_scheduler, device, epochs=10, log_dir='runs/mae3d'):
+def train_mae3d(model, dataloader, test_data_loader, optimizer, lr_scheduler, device, epochs=10, log_dir='runs/mae3d', cls_loss_weight=1.0):
     model.train()
-    # We use MSE loss for reconstruction (alternatively, if your patches are binary, consider BCE loss)
     writer = SummaryWriter(log_dir=log_dir)
     global_step = 0
-    criterion = nn.MSELoss()
     for epoch in range(epochs):
-        total_loss = 0
+        total_recon_loss = 0
+        total_cls_loss = 0
         for batch_idx, (voxels, labels) in enumerate(dataloader):
             voxels = voxels.to(device)  # shape: (B, 1, grid_size, grid_size, grid_size)
+            labels = labels.to(device)
             optimizer.zero_grad()
-            pred, gt, mask = model(voxels)
-            # Only compute loss on masked patches.
-            # pred and gt: (B, num_patches, patch_size^3); mask: (B, num_patches, 1)
+            outputs = model(voxels)
+            if len(outputs) == 4:
+                pred, gt, mask, cls_logits = outputs
+                cls_loss = F.cross_entropy(cls_logits, labels)
+            else:
+                pred, gt, mask = outputs
+                cls_loss = 0.0
             mask = mask.unsqueeze(-1)
-            loss = ((pred - gt)**2 * mask).sum() / mask.sum()
+            recon_loss = ((pred - gt)**2 * mask).sum() / mask.sum()
+            loss = recon_loss + cls_loss_weight * cls_loss
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
-            writer.add_scalar('Loss/Batch', loss.item(), global_step)
+            
+            total_recon_loss += recon_loss.item()
+            total_cls_loss += cls_loss.item() if isinstance(cls_loss, torch.Tensor) else cls_loss
+            writer.add_scalar('Loss/Batch_Recon', recon_loss.item(), global_step)
+            writer.add_scalar('Loss/Batch_Cls', cls_loss.item() if isinstance(cls_loss, torch.Tensor) else cls_loss, global_step)
+            writer.add_scalar('Loss/Batch_Total', loss.item(), global_step)
             global_step += 1
+            
             if batch_idx % 10 == 0:
-                print(f"Epoch [{epoch+1}/{epochs}] Batch [{batch_idx}/{len(dataloader)}] Loss: {loss.item():.4f}")
-
-        avg_loss = total_loss / len(dataloader)
-        writer.add_scalar('Loss/Epoch', avg_loss, epoch)
-        print(f"Epoch [{epoch+1}/{epochs}] Average Loss: {avg_loss:.4f}")
-        # Update the learning rate scheduler using the training loss
-        lr_scheduler.step(avg_loss)
+                print(f"Epoch [{epoch+1}/{epochs}] Batch [{batch_idx}/{len(dataloader)}] Recon Loss: {recon_loss.item():.4f} Cls Loss: {cls_loss.item() if isinstance(cls_loss, torch.Tensor) else cls_loss:.4f} Total Loss: {loss.item():.4f}")
+        
+        avg_recon_loss = total_recon_loss / len(dataloader)
+        avg_cls_loss = total_cls_loss / len(dataloader)
+        writer.add_scalar('Loss/Epoch_Recon', avg_recon_loss, epoch)
+        writer.add_scalar('Loss/Epoch_Cls', avg_cls_loss, epoch)
+        print(f"Epoch [{epoch+1}/{epochs}] Average Recon Loss: {avg_recon_loss:.4f} Average Cls Loss: {avg_cls_loss:.4f}")
+        lr_scheduler.step(avg_recon_loss)
         current_lr = optimizer.param_groups[0]['lr']
         writer.add_scalar('Learning Rate', current_lr, epoch)
         print(f"Current learning rate: {current_lr}")
         
-        eval_mae3d(model, epoch, test_data_loader, device, writer)
-
+        eval_mae3d(model, epoch, test_data_loader, device, writer, cls_loss_weight)
+    
     writer.close()
 
-# For demonstration purposes, we create a dummy dataset.
-# In practice, you would use your ChunkedModelNetDataset (or similar) to load your preprocessed voxel data.
+###########################################
+# Dummy Dataset for Demonstration Purposes
+###########################################
+
 class DummyVoxelDataset(Dataset):
-    def __init__(self, num_samples=100, grid_size=30):
+    def __init__(self, num_samples=100, grid_size=30, num_classes=40):
         self.num_samples = num_samples
         self.grid_size = grid_size
+        self.num_classes = num_classes
     def __len__(self):
         return self.num_samples
     def __getitem__(self, idx):
         # Create a random binary voxel grid.
         voxel = (torch.rand(1, self.grid_size, self.grid_size, self.grid_size) > 0.5).float()
-        label = 0  # dummy label
+        # For demonstration, assign a random label.
+        label = torch.randint(0, self.num_classes, (1,)).item()
         return voxel, label
 
+###########################################
+# Main Training Script with Click Options
+###########################################
+
 @click.command()
-@click.option('--train-chunk-dir', default='ModelNet40_train_chunk', help='Prefix for training chunk files')
-@click.option('--test-chunk-dir', default='ModelNet40_test_chunk', help='Prefix for test chunk files')
+@click.option('--train-chunk-dir', default='ModelNet40_train_chunk', help='Directory for training chunk files')
+@click.option('--test-chunk-dir', default='ModelNet40_test_chunk', help='Directory for test chunk files')
 @click.option('--patch-size', default=5, type=int, help='Size of 3D patches')
 @click.option('--grid-size', default=30, type=int, help='Size of input voxel grid')
 @click.option('--embed-dim', default=128, type=int, help='Embedding dimension for patch tokens')
@@ -257,12 +321,13 @@ class DummyVoxelDataset(Dataset):
 @click.option('--batch-size', default=64, type=int, help='Training batch size')
 @click.option('--epochs', default=100, type=int, help='Number of training epochs')
 @click.option('--lr', default=1e-3, type=float, help='Learning rate')
-@click.option('--log-dir', default=f'runs/mae3d_{time.strftime("%Y%m%d")}', help='Directory for tensorboard logs')
+@click.option('--cls-loss-weight', default=1.0, type=float, help='Weight for classification loss')
+@click.option('--log-dir', default=f'runs/mae3d_{time.strftime("%Y%m%d%H%S")}', help='Directory for tensorboard logs')
 @click.option('--num-workers', default=2, type=int, help='Number of dataloader workers')
 def main(train_chunk_dir, test_chunk_dir, patch_size, grid_size, embed_dim, 
             encoder_depth, decoder_depth, num_heads, mask_ratio, batch_size, epochs, lr, 
-            log_dir, num_workers):
-    """Train a 3D Masked Autoencoder (MAE) model on ModelNet data."""
+            cls_loss_weight, log_dir, num_workers):
+    """Train a 3D Masked Autoencoder (MAE) model on ModelNet data with a classification head."""
     
     # Set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -279,7 +344,10 @@ def main(train_chunk_dir, test_chunk_dir, patch_size, grid_size, embed_dim,
     print(f"Found {len(train_chunk_files)} training chunk files")
     print(f"Found {len(test_chunk_files)} test chunk files")
 
-    # Load datasets
+    # For demonstration, you can uncomment these two lines to use a dummy dataset instead:
+    # dataset = DummyVoxelDataset(num_samples=500, grid_size=grid_size, num_classes=40)
+    # test_dataset = DummyVoxelDataset(num_samples=100, grid_size=grid_size, num_classes=40)
+    # Otherwise, use your chunked datasets:
     print("Loading training dataset...")
     dataset = ChunkedModelNetDataset(train_chunk_files)
     print(f"Training dataset size: {len(dataset)}")
@@ -292,11 +360,11 @@ def main(train_chunk_dir, test_chunk_dir, patch_size, grid_size, embed_dim,
     data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
     test_data_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     
-    # Initialize model
-    print("Initializing MAE3D model...")
+    # Initialize model with classification head (e.g., 40 classes for ModelNet40)
+    print("Initializing MAE3D model with classification head...")
     model = MAE3D(patch_size=patch_size, grid_size=grid_size, embed_dim=embed_dim, 
-                    encoder_depth=encoder_depth, decoder_depth=decoder_depth, 
-                    num_heads=num_heads, mask_ratio=mask_ratio)
+                  encoder_depth=encoder_depth, decoder_depth=decoder_depth, 
+                  num_heads=num_heads, mask_ratio=mask_ratio, num_classes=40)
     model.to(device)
     
     # Setup optimizer and learning rate scheduler
@@ -310,7 +378,9 @@ def main(train_chunk_dir, test_chunk_dir, patch_size, grid_size, embed_dim,
     
     print(f"Starting training for {epochs} epochs...")
     train_mae3d(model, data_loader, test_data_loader, optimizer, lr_scheduler, device, 
-                epochs=epochs, log_dir=log_dir)
+                epochs=epochs, log_dir=log_dir, cls_loss_weight=cls_loss_weight)
+    
+    torch.save(model.state_dict(), os.path.join(log_dir, 'mae3d_model.pth'))
     
     print("Training complete!")
 

@@ -1,4 +1,4 @@
 import trimesh
 
-mesh = trimesh.load("ModelNet40/cup/train/cup_0044.off")
+mesh = trimesh.load("C:/Users/ntuee/Desktop/cognasim_modelnet_challenge/ModelNet40/bottle/train/bottle_0001.off")
 mesh.show()
