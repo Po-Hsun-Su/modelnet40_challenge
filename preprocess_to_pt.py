@@ -89,7 +89,7 @@ def serialize_dataset_in_chunks(root_dir, split='train', grid_size=30, output_pr
         # Save chunk if full or if it's the last sample
         if len(chunk_data) == chunk_size or idx == total_samples - 1:
             chunk_file = f"{output_prefix}_{split}_chunk_{current_chunk}.pt"
-            # torch.save(chunk_data, chunk_file)
+            torch.save(chunk_data, chunk_file)
             print(f"Saved chunk {current_chunk} with {len(chunk_data)} samples to {chunk_file}")
             current_chunk += 1
             chunk_data = []
