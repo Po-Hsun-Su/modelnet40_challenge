@@ -1,0 +1,20 @@
+{
+  "experiment_name": "cls_only_base_line",
+  "recon_loss_weight": 0.0,
+  "mask_ratio": 0.0,
+  "train_chunk_dir": "ModelNet40_train_chunk",
+  "test_chunk_dir": "ModelNet40_test_chunk",
+  "patch_size": 5,
+  "grid_size": 30,
+  "embed_dim": 128,
+  "encoder_depth": 4,
+  "decoder_depth": 2,
+  "num_heads": 4,
+  "batch_size": 64,
+  "epochs": 100,
+  "pretrain_stop_epoch": null,
+  "lr": 0.001,
+  "cls_loss_weight": 1.0,
+  "num_workers": 4,
+  "augment": false
+}
